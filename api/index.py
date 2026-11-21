@@ -4,9 +4,6 @@ import httpx
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from dotenv import load_dotenv
-
-load_dotenv()
 
 app = FastAPI(title="PLANIT AI Student Gateway")
 
@@ -39,13 +36,17 @@ async def generate_plan(
     if student_key not in VALID_STUDENT_KEYS:
         raise HTTPException(status_code=403, detail="Invalid student API key")
 
+    api_key = (os.getenv("UPSTREAM_API_KEY") or "").strip().strip('"').strip("'")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Missing UPSTREAM_API_KEY in Vercel")
+
     headers = {
-        "Authorization": f"Bearer {os.getenv('UPSTREAM_API_KEY')}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
     payload = {
-        "model": os.getenv("MODEL_NAME"),
+        "model": "openai/gpt-oss-120b",
         "messages": [
             {
                 "role": "system",
@@ -63,7 +64,7 @@ async def generate_plan(
     async with httpx.AsyncClient(timeout=45.0) as client:
         try:
             response = await client.post(
-                os.getenv("UPSTREAM_BASE_URL"),
+                "https://api.groq.com/openai/v1/chat/completions",
                 headers=headers,
                 json=payload
             )
