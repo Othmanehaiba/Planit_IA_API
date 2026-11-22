@@ -1,7 +1,7 @@
 import os
 import json
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="PLANIT AI Student Gateway")
@@ -23,12 +23,18 @@ VALID_STUDENT_KEYS = {
 @app.post("/api/generate-plan")
 async def generate_plan(
     request: Request,
-    authorization: str | None = Header(default=None)
+    authorization: str | None = Header(default=None),
+    key: str | None = Query(default=None)
 ):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer API key")
-    
-    student_key = authorization.replace("Bearer ", "").strip()
+    # Accepte soit Authorization: Bearer <cle>, soit ?key=<cle>
+    student_key = ""
+    if authorization and authorization.startswith("Bearer "):
+        student_key = authorization.replace("Bearer ", "").strip()
+    elif key:
+        student_key = key.strip()
+
+    if not student_key:
+        raise HTTPException(status_code=401, detail="Missing API key")
     if student_key not in VALID_STUDENT_KEYS:
         raise HTTPException(status_code=403, detail="Invalid student API key")
 
@@ -38,51 +44,42 @@ async def generate_plan(
 
     body = await request.json()
 
-    # Supporte à la fois le format OpenAI de api.js ({messages: [...]}) et {prompt: "..."}
+    is_gemini_format = "contents" in body
     is_openai_format = "messages" in body
-    if is_openai_format:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a project planning API. Return ONLY valid raw JSON "
-                    "matching the requested schema. Never include markdown fences or explanations."
-                )
-            },
-            *body["messages"]
-        ]
+
+    system_msg = {
+        "role": "system",
+        "content": (
+            "You are a project planning API. Return ONLY valid raw JSON "
+            "matching the requested schema. Never include markdown fences or explanations."
+        )
+    }
+
+    if is_gemini_format:
+        parts = body.get("contents", [{}])[0].get("parts", [])
+        prompt_text = "".join(p.get("text", "") for p in parts)
+        messages = [system_msg, {"role": "user", "content": prompt_text}]
+    elif is_openai_format:
+        messages = [system_msg, *body["messages"]]
     elif "prompt" in body:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a project planning API. Return ONLY valid raw JSON "
-                    "matching the requested schema. Never include markdown fences or explanations."
-                )
-            },
-            {"role": "user", "content": body["prompt"]}
-        ]
+        messages = [system_msg, {"role": "user", "content": body["prompt"]}]
     else:
-        raise HTTPException(status_code=400, detail="Missing 'messages' or 'prompt' in request body")
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": "openai/gpt-oss-120b",
-        "messages": messages,
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"}
-    }
+        raise HTTPException(status_code=400, detail="Invalid request format")
 
     async with httpx.AsyncClient(timeout=45.0) as client:
         try:
             response = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers,
-                json=payload
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "openai/gpt-oss-120b",
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"}
+                }
             )
             response.raise_for_status()
             data = response.json()
@@ -90,15 +87,28 @@ async def generate_plan(
 
             cleaned = raw_content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             parsed = json.loads(cleaned)
+            json_str = json.dumps(parsed, ensure_ascii=False)
 
-            # Si l'appel vient de callOpenAI() dans api.js, on renvoie la structure OpenAI attendue
+            # Réponse format Gemini pour leur nouveau api.js
+            if is_gemini_format:
+                return {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": json_str}]
+                            }
+                        }
+                    ]
+                }
+
+            # Réponse format OpenAI
             if is_openai_format:
                 return {
                     "choices": [
                         {
                             "message": {
                                 "role": "assistant",
-                                "content": json.dumps(parsed, ensure_ascii=False)
+                                "content": json_str
                             }
                         }
                     ]
