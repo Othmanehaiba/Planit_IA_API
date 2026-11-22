@@ -1,9 +1,8 @@
 import os
 import json
 import httpx
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 app = FastAPI(title="PLANIT AI Student Gateway")
 
@@ -21,12 +20,9 @@ VALID_STUDENT_KEYS = {
     "planit-2026-demo",
 }
 
-class PlanRequest(BaseModel):
-    prompt: str
-
 @app.post("/api/generate-plan")
 async def generate_plan(
-    body: PlanRequest,
+    request: Request,
     authorization: str | None = Header(default=None)
 ):
     if not authorization or not authorization.startswith("Bearer "):
@@ -40,14 +36,12 @@ async def generate_plan(
     if not api_key:
         raise HTTPException(status_code=500, detail="Missing UPSTREAM_API_KEY in Vercel")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    body = await request.json()
 
-    payload = {
-        "model": "openai/gpt-oss-120b",
-        "messages": [
+    # Supporte à la fois le format OpenAI de api.js ({messages: [...]}) et {prompt: "..."}
+    is_openai_format = "messages" in body
+    if is_openai_format:
+        messages = [
             {
                 "role": "system",
                 "content": (
@@ -55,8 +49,30 @@ async def generate_plan(
                     "matching the requested schema. Never include markdown fences or explanations."
                 )
             },
-            {"role": "user", "content": body.prompt}
-        ],
+            *body["messages"]
+        ]
+    elif "prompt" in body:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a project planning API. Return ONLY valid raw JSON "
+                    "matching the requested schema. Never include markdown fences or explanations."
+                )
+            },
+            {"role": "user", "content": body["prompt"]}
+        ]
+    else:
+        raise HTTPException(status_code=400, detail="Missing 'messages' or 'prompt' in request body")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": "openai/gpt-oss-120b",
+        "messages": messages,
         "temperature": 0.2,
         "response_format": {"type": "json_object"}
     }
@@ -73,7 +89,22 @@ async def generate_plan(
             raw_content = data["choices"][0]["message"]["content"]
 
             cleaned = raw_content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            return json.loads(cleaned)
+            parsed = json.loads(cleaned)
+
+            # Si l'appel vient de callOpenAI() dans api.js, on renvoie la structure OpenAI attendue
+            if is_openai_format:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(parsed, ensure_ascii=False)
+                            }
+                        }
+                    ]
+                }
+
+            return parsed
 
         except httpx.HTTPStatusError as e:
             raise HTTPException(status_code=502, detail=f"Upstream LLM error: {e.response.text}")
